@@ -1,13 +1,20 @@
 from config import *
 
-# In config.py, make sure tip and syringe selections match what you are using
+"""
+#### CHANGE LOG ####
+4/28/2018 - Changed where syringe type and tip type are chosen. Now user selects that when creating G object
+
+5/10/2018 - Fixed set_axis_steps_per_mm() function
+"""
 
 #define the G object
 class G(object):
-	def __init__(self,output_digits=4,num_extruder=1,initial_feedrate=100.0,include_header=True):
+	def __init__(self,microstepping=MICROSTEPPING,output_digits=4,num_extruder=1,initial_feedrate=100.0,include_header=True,syringe="BD-1ml",tip="JG24-1.25TTX"):
 		"""
 		Parameters
 		-----------
+		microstepping : int (default: 16)
+			What to multiply the original steps/revolution for motors
 		output_digits : int (default: 6)
 			How many digits to include after decimal in output gcode
 		num_extruder : int (default: 1)
@@ -17,10 +24,21 @@ class G(object):
 		header : bool (default: True)
 			If true, will display the header at the top of the Gcode
 		"""
+		self.microstepping = microstepping
 		self.output_digits = output_digits
 		self.num_extruder = num_extruder
 		self.speed = initial_feedrate
 		self.include_header = include_header
+		# Extrusion calculations
+		self.steps_per_rev = int(self.microstepping*360/MOTOR_STEP_ANGLE)
+		self.syringe = syringe
+		self.syringe_diameter = SYRINGE_DIAMETER[self.syringe] # mm
+		self.syringe_cross_section = math.pi*(self.syringe_diameter/2)**2 # mm
+		self.tip = tip
+		self.tip_ID = TIP_ID[self.tip]
+		self.tip_cross_section = math.pi*(self.tip_ID/2)**2
+		# Waste volume
+		self.waste_volume = SYRINGE_WASTE_SPACE[self.syringe] + TIP_VOID_VOLUME[self.tip]
 
 		###===== Internal variables =====###
 		self.mm_to_steps = dict(zip(AXES,DEFAULT_AXIS_STEPS_PER_MM))
@@ -34,6 +52,7 @@ class G(object):
 		self.print_time = 0 # seconds
 		self.is_relative = True # relative or absolute positioning
 		self.extrusionrate_constant = False # if true, extrusion rate will always be kept the same
+		self.allow_cold_extrusion = None # if true, allows E moves to occur
 
 		# run setup method
 		self.setup()
@@ -70,12 +89,14 @@ class G(object):
 				edistance = abs(diff*self.steps_to_mm[axes])
 				if axes is AXES[3] and target > self.max_e_position:
 					ediff = target - self.max_e_position
-					extruded_volume = ediff*self.steps_to_mm[axes]*SYRINGE_CROSS_SECTIONAL_AREA # uL
+					extruded_volume = ediff*self.steps_to_mm[axes]*self.syringe_cross_section # uL
 					self.extrusion_volume += extruded_volume
 					self.max_e_position = target
 
 			self._current_position[axes] += diff
 
+		# load output digits
+		d = self.output_digits
 		# calculate Euclidean distance
 		xyzdistance = math.sqrt(xyzdistance)
 		# calculate move time 
@@ -83,13 +104,15 @@ class G(object):
 			move_time = 60.*xyzdistance/self.speed
 			if edistance != 0.0:
 				espeed = 60.*edistance/move_time # mm/min
-				flowrate = espeed*SYRINGE_CROSS_SECTIONAL_AREA/60. # uL/s
-				print(";Extrusion rate: {} mm/min | Flow rate: {} uL/s".format(espeed,flowrate))
+				flowrate = espeed*self.syringe_cross_section/60. # uL/s
+				print(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s".format(espeed,flowrate,digits=d))
 		elif xyzdistance == 0.0 and edistance != 0.0:
 			move_time = 60.*edistance/self.speed
 			espeed = 60.*edistance/move_time # mm/min
-			flowrate = espeed*SYRINGE_CROSS_SECTIONAL_AREA/60. # uL/s
-			print(";Extrusion rate: {} mm/min | Flow rate: {} uL/s".format(espeed,flowrate))
+			flowrate = espeed*self.syringe_cross_section/60. # uL/s
+			print(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s".format(espeed,flowrate,digits=d))
+		else:
+			move_time = 0
 		self.print_time += move_time
 
 		# update travel distance 
@@ -129,7 +152,7 @@ class G(object):
 		# Calculate extrusion distance from volume if applicable
 		if e is not None:
 			if extrusionunit == 'uL' or extrusionunit == 'ul':
-				e = e/SYRINGE_CROSS_SECTIONAL_AREA # mm
+				e = e/self.syringe_cross_section # mm
 		# Update internal tracking variables
 		self._update_current_position(x,y,z,e)
 		args = self._format_args(x,y,z,e)
@@ -153,7 +176,7 @@ class G(object):
 		# Calculate extrusion distance from volume if applicable
 		if e is not None:
 			if extrusionunit == 'uL' or extrusionunit == 'ul':
-				e = e/SYRINGE_CROSS_SECTIONAL_AREA # mm
+				e = e/self.syringe_cross_section # mm
 		# The printer currently does not have a retract function
 		# Extruded material cannot be retracted.
 		# For these two reasons above, the below must be executed for tracking amount of volume used.
@@ -168,7 +191,7 @@ class G(object):
 			self.extrusion_distance += edistance
 			if target > self.max_e_position:
 				ediff = target - self.max_e_position
-				extruded_volume = ediff*self.steps_to_mm[axes]*SYRINGE_CROSS_SECTIONAL_AREA # uL
+				extruded_volume = ediff*self.steps_to_mm[axes]*self.syringe_cross_section # uL
 				self.extrusion_volume += extruded_volume
 				self.max_e_position = target
 			self._current_position[axes] += diff
@@ -179,8 +202,9 @@ class G(object):
 		move_time = 60.*xydistance/self.speed
 		if edistance != 0.0:
 			espeed = 60.*edistance/move_time # mm/min
-			flowrate = espeed*SYRINGE_CROSS_SECTIONAL_AREA/60. # uL/s
-			print(";Extrusion rate: {} mm/min | Flow rate: {} uL/s".format(espeed,flowrate))
+			flowrate = espeed*self.syringe_cross_section/60. # uL/s
+			d = self.output_digits
+			print(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s".format(espeed,flowrate,digits=d))
 		self.print_time += move_time
 
 		# Figure out direction to make circle
@@ -211,18 +235,25 @@ class G(object):
 		if changed_positioning:
 			self.absolute()
 
-	def set_feedrate(self,rate,extrusionunit='mm'):
+	def set_feedrate(self,rate,extrusionunit='mm/min'):
 		""" Set the feed rate (tool head speed) in mm/min
-
 		Parameters
 		----------
 		rate : float
 			The speed to move the tool head in mm/min
-		extrusionunit : 'mm/min' or 'uL/min' or 'uL'
+		extrusionunit : 'mm/min' or 'uL/min' or mL/min
 		"""
 		d = self.output_digits
-		self.write('G1 F{:.{digits}f}'.format(rate,digits=d))
-		self.speed = rate
+		if extrusionunit == 'mm/min':
+			self.speed = rate
+		elif extrusionunit == 'uL/min':
+			self.speed = rate / self.syringe_cross_section
+		elif extrusionunit == 'mL/min':
+			self.speed = 1000*rate / self.syringe_cross_section
+
+		self.write(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s ({2:.{digits}f} mL/min)".format(self.speed,self.speed*self.syringe_cross_section/60,self.speed*self.syringe_cross_section/1000,digits=d))
+		self.write('G1 F{:.{digits}f}'.format(self.speed,digits=d))
+		
 
 	def relative(self):
 		self.write('G91')
@@ -232,22 +263,27 @@ class G(object):
 		self.write('G90')
 		self.is_relative = False
 
-	def allow_cold_extrusion(self,mode=True):
+	def cold_extrusion(self,mode=True):
 		msg = 'M302 P'
 		if mode == True:
 			msg += '1'
 		else:
 			msg += '0'
+		self.allow_cold_extrusion = mode
 		self.write(msg)
 
 	def set_axis_steps_per_mm(self,x=None,y=None,z=None,e=None,comment=None):
 		if x is not None:
+			self.steps_to_mm[AXES[0]] = 1./x
 			self.mm_to_steps[AXES[0]] = x
 		if y is not None:
+			self.steps_to_mm[AXES[1]] = 1./y
 			self.mm_to_steps[AXES[1]] = y
 		if z is not None:
+			self.steps_to_mm[AXES[2]] = 1./z
 			self.mm_to_steps[AXES[2]] = z
 		if e is not None:
+			self.steps_to_mm[AXES[3]] = 1./e
 			self.mm_to_steps[AXES[3]] = e
 
 		args = self._format_args(x,y,z,e)
@@ -260,6 +296,7 @@ class G(object):
 		# Print the line
 		self.write(cmd)
 
+
 	# ---------- G-Code COMMENT METHODS --------- #
 
 	def print_blank_line(self):
@@ -268,22 +305,35 @@ class G(object):
 	def setup(self):
 		if self.include_header:
 			self.header()
-		self.write('')
+		self.print_blank_line()
+		# set as relative move
+		self.relative()
+		# set the axis steps per unit
+		self.set_axis_steps_per_mm(x=DEFAULT_AXIS_STEPS_PER_MM[0],y=DEFAULT_AXIS_STEPS_PER_MM[1],z=DEFAULT_AXIS_STEPS_PER_MM[2],e=DEFAULT_AXIS_STEPS_PER_MM[3])
+		# turn off cold extrusion prevention
+		self.cold_extrusion()
+		# set initial speed
+		self.set_feedrate(self.speed)
+		self.print_blank_line()
+
 
 	def header(self):
-		self.write(';Printer is using {}X microstepping'.format(MICROSTEPPING))
+		# load the set output digits
+		d = self.output_digits
+		self.write(';Printer is using {}X microstepping'.format(self.microstepping))
 		self.write(';There are {} steps per revolution of the motor.'.format(STEPS_PER_REVOLUTION))
 		args = [axes+str(1000.*self.steps_to_mm[axes]) for axes in AXES]
 		args = ' '.join(args)
 		self.write(';Min. travel/extrusion distance (um): '+args)
-		self.write(';Syringe type: {}'.format(SYRINGE))
-		self.write(';Syringe waste volume (mL): {}'.format(SYRINGE_WASTE_SPACE[SYRINGE]))
-		self.write(';Min. extrudable volume (uL): {}'.format(self.steps_to_mm[AXES[3]]*SYRINGE_CROSS_SECTIONAL_AREA))
-		self.write(';Tip type: {}'.format(TIP))
-		self.write(';Tip diameter (mm): {}'.format(TIP_CROSS_SECTIONAL_DIAMETER))
-		self.write(';Tip void volume (mL): {}'.format(TIP_VOID_VOLUME[TIP]))
-		self.write(';Volumetric flow: {} uL/min for every 100 mm/min'.format(100*SYRINGE_CROSS_SECTIONAL_AREA))
-		self.write(';For syringe extrusion rate of 100 mm/min, tip extrusion rate is {} mm/min'.format(100.0*SYRINGE_CROSS_SECTIONAL_AREA/TIP_CROSS_SECTIONAL_AREA))
+		self.write(';Syringe type: {}'.format(self.syringe))
+		self.write(';Syringe extrusion (uL/mm): {:.{digits}f}'.format(self.syringe_cross_section,digits=d))
+		self.write(';Syringe waste volume (mL): {}'.format(SYRINGE_WASTE_SPACE[self.syringe]))
+		self.write(';Min. extrudable volume (uL): {:.{digits}f}'.format(self.steps_to_mm[AXES[3]]*self.syringe_cross_section,digits=d))
+		self.write(';Tip type: {}'.format(self.tip))
+		self.write(';Tip diameter (mm): {:.{digits}f}'.format(self.tip_cross_section,digits=d))
+		self.write(';Tip void volume (mL): {:.{digits}f}'.format(TIP_VOID_VOLUME[self.tip],digits=d))
+		self.write(';Volumetric flow: {:.{digits}f} uL/min for every 100 mm/min'.format(100*self.syringe_cross_section,digits=d))
+		self.write(';For syringe extrusion rate of 100 mm/min, tip extrusion rate is {:.{digits}f} mm/min'.format(100.0*self.syringe_cross_section/self.tip_cross_section,digits=d))
 
 	def summary_report(self):
 		self.write('')
@@ -327,7 +377,7 @@ class G(object):
 		self.write(msg)
 
 # ========== Cartesian shape functions ========== #
-	def print_disc(self,r2,r1,step,thickness):
+	def print_disc(self,r2,r1,step,thickness,direction='outwards'):
 		num_ring = int(1+(r2-r1)/step)
 		step_list = [step*i for i in range(num_ring)]
 		radii = [r2-i for i in step_list]
@@ -337,7 +387,7 @@ class G(object):
 		# now calculate total volume
 		vol = math.pi*thickness*((r2**2) - (r1**2))
 		# calculate e move
-		total_e = vol/SYRINGE_CROSS_SECTIONAL_AREA
+		total_e = vol/self.syringe_cross_section
 		e_list = [total_e*i for i in weights]
 		# plan for move
 		for i in range(num_ring):
@@ -352,8 +402,7 @@ class G(object):
 		
 if __name__ == "__main__":
 	g = G()
-	g.set_feedrate(100)
-	g.move(y=50,x=50)
-	g.print_blank_line()
-	g.print_disc(6,2,1,0.3)
+	g.move(x=0.0001)
 	g.summary_report()
+
+	
