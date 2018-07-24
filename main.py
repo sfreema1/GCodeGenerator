@@ -9,7 +9,7 @@ from config import *
 
 #define the G object
 class G(object):
-	def __init__(self,microstepping=MICROSTEPPING,output_digits=4,num_extruder=1,initial_feedrate=100.0,include_header=True,syringe="BD-1ml",tip="JG24-1.25TTX"):
+	def __init__(self,microstepping=MICROSTEPPING,output_digits=4,num_extruder=1,initial_feedrate=100.0,include_header=True,syringe="BD-1ml",tip="JG24-1.25TTX",layer_height=0.3):
 		"""
 		Parameters
 		-----------
@@ -28,6 +28,7 @@ class G(object):
 		self.output_digits = output_digits
 		self.num_extruder = num_extruder
 		self.speed = initial_feedrate
+		self.layer_height = layer_height
 		self.include_header = include_header
 		# Extrusion calculations
 		self.steps_per_rev = int(self.microstepping*360/MOTOR_STEP_ANGLE)
@@ -65,7 +66,20 @@ class G(object):
 			return self._current_position[axis]*self.steps_to_mm[axis]
 
 	def _update_current_position(self,x=None,y=None,z=None,e=None,**kwargs):
-		# redirect input values from command
+		"""
+		_update_current_position algorithm
+		0. Instantiate default local variables necessary for function
+		1. Gather axial move inputs from user into dict dims
+		2. Calculate the number of steps to reach new location
+		3. 
+		"""
+		# 0. Instantiate default local variables necessary for function
+		xyzdistance = 0.0 	# distance of move
+		edistance = 0.0 	# distance of extrusion
+		move_time = 0.0 	# elapsed time during move
+		# load output digits
+		d = self.output_digits
+		# 1. Gather axial input values from user input
 		dims = {}
 		if x is not None:
 			dims[AXES[0]] = x
@@ -76,43 +90,47 @@ class G(object):
 		if e is not None:
 			dims[AXES[3]] = e
 
-		xyzdistance = 0.0 # distance of move
-		edistance = 0.0 # distance of extrusion
-
 		for axes in dims.keys():
+			# the user's desired coordinate destination is calculated (in mm)
 			destination = dims[axes] + self._get_position(axes,'mm') if self.is_relative else dims[axes]
+			# the destination's coordinates are converted to motor steps
+			# the target position is rounded to the nearest step
 			target = int(round(destination*self.mm_to_steps[axes]))
+			# the difference in steps from current position to desired position is calculated
 			diff = target - self._get_position(axes)
-			if axes is not AXES[3]:
+			# handle summing travel and extrusion distances
+			if axes in MOTION_AXES:
 				xyzdistance += (diff*self.steps_to_mm[axes])**2
-			else:
+			elif axes in EXTRUSION_AXES:
 				edistance = abs(diff*self.steps_to_mm[axes])
-				if axes is AXES[3] and target > self.max_e_position:
+				if target > self.max_e_position:
 					ediff = target - self.max_e_position
 					extruded_volume = ediff*self.steps_to_mm[axes]*self.syringe_cross_section # uL
 					self.extrusion_volume += extruded_volume
 					self.max_e_position = target
-
 			self._current_position[axes] += diff
-
-		# load output digits
-		d = self.output_digits
+	
 		# calculate Euclidean distance
-		xyzdistance = math.sqrt(xyzdistance)
+		xyzdistance = math.sqrt(xyzdistance) # mm
+
 		# calculate move time 
 		if xyzdistance != 0.0:
 			move_time = 60.*xyzdistance/self.speed
 			if edistance != 0.0:
 				espeed = 60.*edistance/move_time # mm/min
 				flowrate = espeed*self.syringe_cross_section/60. # uL/s
-				print(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s".format(espeed,flowrate,digits=d))
+				filamentarea = extruded_volume / xyzdistance # mm^2
+				filamentwidth = 4*filamentarea / math.pi / self.layer_height # mm (assumes ellipse)
+				print(";Extr. rate: {0:.{digits}f} mm/min ({1:.{digits}f} uL/s | {2:.{digits}f} mL/min)".format(espeed,flowrate,60.*flowrate/1000.,digits=d))
+				print(";Extr. volume: {0:.{digits}f} uL| Filament area: {1:.{digits}f} mm^2".format(extruded_volume,filamentarea,digits=d))
+				print(";Filament width (elliptical assumption): {0:.{digits}f} mm".format(filamentwidth,digits=d))
 		elif xyzdistance == 0.0 and edistance != 0.0:
 			move_time = 60.*edistance/self.speed
 			espeed = 60.*edistance/move_time # mm/min
 			flowrate = espeed*self.syringe_cross_section/60. # uL/s
-			print(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s".format(espeed,flowrate,digits=d))
-		else:
-			move_time = 0
+			print(";Extr. rate: {0:.{digits}f} mm/min ({1:.{digits}f} uL/s | {2:.{digits}f} mL/min)".format(espeed,flowrate,60.*flowrate/1000.,digits=d))
+			print(";Extr. volume {0:.{digits}f} uL".format(extruded_volume,digits=d))
+			
 		self.print_time += move_time
 
 		# update travel distance 
@@ -241,7 +259,8 @@ class G(object):
 		----------
 		rate : float
 			The speed to move the tool head in mm/min
-		extrusionunit : 'mm/min' or 'uL/min' or mL/min
+		extrusionunit : str
+			Units to use when specifying extrusion rate ('mm/min', 'uL/min', mL/min or uL/s)
 		"""
 		d = self.output_digits
 		if extrusionunit == 'mm/min':
@@ -250,8 +269,10 @@ class G(object):
 			self.speed = rate / self.syringe_cross_section
 		elif extrusionunit == 'mL/min':
 			self.speed = 1000*rate / self.syringe_cross_section
+		elif extrusionunit == 'uL/s':
+			self.speed = rate / (60.*self.syringe_cross_section)
 
-		self.write(";Extrusion rate: {0:.{digits}f} mm/min | Flow rate: {1:.{digits}f} uL/s ({2:.{digits}f} mL/min)".format(self.speed,self.speed*self.syringe_cross_section/60,self.speed*self.syringe_cross_section/1000,digits=d))
+		self.write(";Extr. rate: {0:.{digits}f} mm/min ({1:.{digits}f} uL/s | {2:.{digits}f} mL/min)".format(self.speed,self.speed*self.syringe_cross_section/60,self.speed*self.syringe_cross_section/1000,digits=d))
 		self.write('G1 F{:.{digits}f}'.format(self.speed,digits=d))
 		
 
@@ -395,14 +416,36 @@ class G(object):
 			if i != (num_ring-1):
 				self.move(x=step)
 
+	def print_square(self,side,layerheight,spacing=0.2,redundancy=2,lift=0.0):
+		self.print_blank_line()
+		layervolume = layerheight*(side**2)
+		msg1 = ";Printing square layer: {0} X {0} X {1}mm".format(side,layerheight)
+		print(msg1)
+		msg2 = ";Layer volume: {} uL".format(layervolume)
+		print(msg2)
+		if lift>0.0:
+			self.move(z=-lift)
+			self.move(x=-side/2.,y=-side/2.)
+			self.move(z=lift)
+		else:
+			self.move(x=-side/2.,y=-side/2.)
+		# 
+
+
 # ========== Vessel functions ========== #
 	def print_vessel(self,length,thickness):
 		pass
 
+# ========== Debug functions ========== # 
+	def run_test(self):
+		self.move(e=5)
+		self.move(x=5,y=5,e=1.01,extrusionunit='uL')
+		self.print_square(50.1,0.222)
+
 		
 if __name__ == "__main__":
-	g = G()
-	g.move(x=0.0001)
+	g = G(syringe='BD-1ml')
+	g.run_test()
 	g.summary_report()
 
 	
